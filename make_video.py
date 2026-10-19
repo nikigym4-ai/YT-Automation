@@ -1,4 +1,4 @@
-import os, re, json, time, shutil, asyncio, subprocess, datetime, urllib.parse
+import os, re, sys, json, time, shutil, asyncio, subprocess, datetime, urllib.parse
 import requests, edge_tts
 
 GEMINI_KEY = os.environ["GEMINI_KEY"]
@@ -7,6 +7,7 @@ TG_CHAT = os.environ["TG_CHAT_ID"]
 VOICE = "hi-IN-MadhurNeural"
 STYLE = "flat 2D illustration, warm earthy colors, simple shapes, no text"
 API = "https://generativelanguage.googleapis.com/v1beta"
+USE_EDGE = True
 
 
 def ensure_ffmpeg():
@@ -14,6 +15,13 @@ def ensure_ffmpeg():
         return
     subprocess.run("sudo apt-get update -y && sudo apt-get install -y ffmpeg",
                    shell=True, check=True)
+
+
+def ensure_gtts():
+    try:
+        import gtts  # noqa
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "gTTS"], check=True)
 
 
 def pick_topic():
@@ -31,8 +39,8 @@ def candidate_models():
             for m in r.json().get("models", []):
                 n = m.get("name", "").replace("models/", "")
                 ok = "generateContent" in m.get("supportedGenerationMethods", [])
-                bad = any(x in n for x in ("image", "tts", "live", "audio",
-                                           "lite", "exp", "8b", "thinking"))
+                bad = any(x in n for x in ("image", "tts", "live", "audio", "lite",
+                                           "exp", "8b", "thinking", "omni", "preview"))
                 if "flash" in n and ok and not bad and n not in names:
                     found.append(n)
             names += sorted(set(found), reverse=True)
@@ -40,6 +48,7 @@ def candidate_models():
             print("List models status:", r.status_code)
     except Exception as e:
         print("List models error:", e)
+    names = names[:8]
     print("Models to try:", names)
     return names
 
@@ -59,7 +68,7 @@ Return ONLY JSON:
         for attempt in range(2):
             try:
                 r = requests.post(f"{API}/models/{model}:generateContent",
-                                  params={"key": GEMINI_KEY}, json=body, timeout=180)
+                                  params={"key": GEMINI_KEY}, json=body, timeout=120)
                 if r.status_code == 200:
                     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                     text = re.sub(r"^```(?:json)?|```$", "", text.strip(),
@@ -69,25 +78,36 @@ Return ONLY JSON:
                         print("Model used:", model)
                         return data
                     break
-                print(model, r.status_code, r.text[:200])
-                if r.status_code == 429:
-                    time.sleep(20)
+                print(model, r.status_code, r.text[:120])
+                if r.status_code == 503 and attempt == 0:
+                    time.sleep(5)
                     continue
                 break
             except Exception as e:
-                print(model, "error:", e)
-                time.sleep(5)
+                print(model, "error:", str(e)[:120])
+                break
     raise RuntimeError("Script not generated: all Gemini models failed")
 
 
 def make_voice(text, path):
-    for _ in range(4):
+    global USE_EDGE
+    if USE_EDGE:
         try:
             asyncio.run(edge_tts.Communicate(text, VOICE).save(path))
             if os.path.exists(path) and os.path.getsize(path) > 1000:
                 return
         except Exception as e:
-            print("Voice error:", e)
+            print("Edge voice failed, switching to gTTS:", str(e)[:100])
+        USE_EDGE = False
+    ensure_gtts()
+    from gtts import gTTS
+    for _ in range(4):
+        try:
+            gTTS(text=text, lang="hi").save(path)
+            if os.path.exists(path) and os.path.getsize(path) > 1000:
+                return
+        except Exception as e:
+            print("gTTS error:", str(e)[:100])
         time.sleep(5)
     raise RuntimeError("Voice generation failed")
 
@@ -104,7 +124,7 @@ def make_image(prompt, path, seed):
                 return
             print("Image status:", r.status_code)
         except Exception as e:
-            print("Image error:", e)
+            print("Image error:", str(e)[:100])
         time.sleep(8)
     print("Using plain background for", path)
     subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=0x3b2f2f:s=1280x720",
