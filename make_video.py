@@ -1,13 +1,18 @@
-import os, re, sys, json, time, shutil, asyncio, subprocess, datetime, urllib.parse
+import os, re, sys, json, time, shutil, asyncio, subprocess, datetime
 import requests, edge_tts
 
-GEMINI_KEY = os.environ["GEMINI_KEY"]
-TG_TOKEN = os.environ["TG_TOKEN"]
-TG_CHAT = os.environ["TG_CHAT_ID"]
+def clean(v):
+    v = v.strip()
+    return v[3:] if v.lower().startswith("bot") else v
+
+GEMINI_KEY = os.environ["GEMINI_KEY"].strip()
+TG_TOKEN = clean(os.environ["TG_TOKEN"])
+TG_CHAT = os.environ["TG_CHAT_ID"].strip()
 VOICE = "hi-IN-MadhurNeural"
-STYLE = "flat 2D illustration, warm earthy colors, simple shapes, no text"
 API = "https://generativelanguage.googleapis.com/v1beta"
+UA = {"User-Agent": "YTAutomationBot/1.0 (personal educational project)"}
 USE_EDGE = True
+USED = set()
 
 
 def ensure_ffmpeg():
@@ -44,10 +49,8 @@ def candidate_models():
                 if "flash" in n and ok and not bad and n not in names:
                     found.append(n)
             names += sorted(set(found), reverse=True)
-        else:
-            print("List models status:", r.status_code)
     except Exception as e:
-        print("List models error:", e)
+        print("List models error:", str(e)[:100])
     names = names[:8]
     print("Models to try:", names)
     return names
@@ -59,9 +62,10 @@ Make a 3-4 minute educational explainer video script.
 Narration: Hindi in Devanagari script, simple and conversational (Hinglish feel);
 write English terms in Devanagari too. Use only well-established facts; avoid
 uncertain numbers and dates. Exactly 12 scenes, each narration 2-3 sentences.
-image_prompt: English, describes the visual for that scene.
+search_query: 2-4 English words naming a concrete real subject that has photos or
+artwork on Wikimedia Commons for that scene (example: "Great Wall of China").
 Return ONLY JSON:
-{{"title":"...","description":"...","scenes":[{{"narration":"...","image_prompt":"..."}}]}}"""
+{{"title":"...","description":"...","scenes":[{{"narration":"...","search_query":"..."}}]}}"""
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json"}}
     for model in candidate_models():
@@ -112,23 +116,46 @@ def make_voice(text, path):
     raise RuntimeError("Voice generation failed")
 
 
-def make_image(prompt, path, seed):
-    q = urllib.parse.quote(f"{prompt}, {STYLE}")
-    url = (f"https://image.pollinations.ai/prompt/{q}"
-           f"?width=1280&height=720&nologo=true&seed={seed}")
-    for _ in range(4):
+def commons_urls(query):
+    params = {"action": "query", "format": "json", "generator": "search",
+              "gsrsearch": f"{query} filetype:bitmap", "gsrnamespace": 6,
+              "gsrlimit": 12, "prop": "imageinfo", "iiprop": "url|mime|size",
+              "iiurlwidth": 1600}
+    r = requests.get("https://commons.wikimedia.org/w/api.php", params=params,
+                     headers=UA, timeout=40)
+    pages = r.json().get("query", {}).get("pages", {})
+    out = []
+    for p in sorted(pages.values(), key=lambda p: p.get("index", 0)):
+        info = (p.get("imageinfo") or [{}])[0]
+        url = info.get("thumburl") or info.get("url")
+        mime = info.get("mime")
+        if url and url not in USED and mime in ("image/jpeg", "image/png") \
+                and info.get("width", 0) >= 600:
+            out.append((url, "png" if mime == "image/png" else "jpg"))
+    return out
+
+
+def make_image(queries, i):
+    for q in queries:
+        if not q:
+            continue
         try:
-            r = requests.get(url, timeout=120)
-            if r.status_code == 200 and len(r.content) > 5000:
-                open(path, "wb").write(r.content)
-                return
-            print("Image status:", r.status_code)
+            for url, ext in commons_urls(q)[:4]:
+                r = requests.get(url, headers=UA, timeout=60)
+                if r.status_code == 200 and len(r.content) > 8000:
+                    USED.add(url)
+                    path = f"s{i}.{ext}"
+                    open(path, "wb").write(r.content)
+                    print("Image ok for:", q)
+                    return path
         except Exception as e:
             print("Image error:", str(e)[:100])
-        time.sleep(8)
-    print("Using plain background for", path)
+        time.sleep(1)
+    print("Using plain background for scene", i + 1)
+    path = f"s{i}.png"
     subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=0x3b2f2f:s=1280x720",
                     "-frames:v", "1", path], check=True, capture_output=True)
+    return path
 
 
 def duration(path):
@@ -144,14 +171,15 @@ def run_ffmpeg(cmd):
         raise RuntimeError("ffmpeg failed")
 
 
-def build_scene(i, scene):
-    img, aud, vid = f"s{i}.jpg", f"s{i}.mp3", f"s{i}.mp4"
+def build_scene(i, scene, topic):
+    aud, vid = f"s{i}.mp3", f"s{i}.mp4"
     make_voice(scene["narration"], aud)
-    make_image(scene["image_prompt"], img, seed=i + 1)
+    img = make_image([scene.get("search_query", ""), topic], i)
     dur = duration(aud) + 0.4
     frames = int(dur * 25) + 10
-    vf = (f"scale=1920:1080,zoompan=z='min(zoom+0.0007,1.2)':d={frames}"
-          f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1280x720:fps=25,format=yuv420p")
+    vf = ("scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,"
+          f"zoompan=z='min(zoom+0.0007,1.2)':d={frames}"
+          ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1280x720:fps=25,format=yuv420p")
     run_ffmpeg(["ffmpeg", "-y", "-i", img, "-i", aud, "-vf", vf, "-t", f"{dur:.2f}",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
                 "-c:a", "aac", "-ar", "44100", "-ac", "2", vid])
@@ -187,14 +215,16 @@ def main():
     topic = pick_topic()
     print("Topic:", topic)
     data = get_script(topic)
-    clips = [build_scene(i, s) for i, s in enumerate(data["scenes"])]
+    clips = [build_scene(i, s, topic) for i, s in enumerate(data["scenes"])]
     with open("list.txt", "w") as f:
         for c in clips:
             f.write(f"file '{c}'\n")
     run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt",
                 "-c", "copy", "final.mp4"])
     final = shrink_if_needed("final.mp4")
-    text = f"Title: {data.get('title', topic)}\n\nDescription:\n{data.get('description', '')}"
+    text = (f"Title: {data.get('title', topic)}\n\nDescription:\n"
+            f"{data.get('description', '')}\n\nImages: Wikimedia Commons "
+            f"(check each image's license/credit before uploading)")
     send_telegram(final, text)
 
 
